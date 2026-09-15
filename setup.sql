@@ -1,0 +1,253 @@
+-- ============================================================
+--  CommunityPro — Supabase Database Schema
+--  Run this in: Supabase Dashboard → SQL Editor → New Query
+-- ============================================================
+
+-- ========================
+-- PROFILES (all app users)
+-- ========================
+create table if not exists public.profiles (
+  id            uuid         default gen_random_uuid() primary key,
+  name          text         not null,
+  email         text         not null,
+  password_hash text         not null,
+  role          text         not null default 'user'
+                             check (role in ('superadmin', 'siteadmin', 'user')),
+  site_id       uuid,
+  phone         text,
+  created_at    timestamptz  default now(),
+  constraint profiles_email_unique unique (email)
+);
+
+-- ========================
+-- SITES
+-- ========================
+create table if not exists public.sites (
+  id            uuid         default gen_random_uuid() primary key,
+  name          text         not null,
+  range         text,
+  area          text,
+  city          text,
+  district      text,
+  pin_code      text,
+  state         text,
+  country       text,
+  description   text,
+  admin_id      uuid         references public.profiles(id) on delete set null,
+  created_at    timestamptz  default now()
+);
+
+-- If upgrading an existing database, run these to add new columns:
+alter table public.sites add column if not exists range    text;
+alter table public.sites add column if not exists area     text;
+alter table public.sites add column if not exists city     text;
+alter table public.sites add column if not exists district text;
+alter table public.sites add column if not exists pin_code text;
+alter table public.sites add column if not exists state    text;
+alter table public.sites add column if not exists country  text;
+
+-- New role permission columns (run when upgrading from earlier schema)
+alter table public.roles add column if not exists site_admin_access  boolean default false;
+alter table public.roles add column if not exists create_members     boolean default false;
+alter table public.roles add column if not exists create_dependents  boolean default false;
+alter table public.roles add column if not exists create_users       boolean default false;
+alter table public.members add column if not exists photo_url        text;
+alter table public.members add column if not exists dashboard_view_order integer;
+
+-- Profile picture storage paths (Supabase Storage bucket: profile-pictures)
+alter table public.members              add column if not exists profile_picture_path text;
+alter table public.board_committee_list add column if not exists profile_picture_path text;
+
+-- board_committee_list — statewide committee board (managed from Super Admin → State Committee)
+alter table public.board_committee_list add column if not exists country_id           bigint;
+alter table public.board_committee_list add column if not exists state_id             bigint;
+alter table public.board_committee_list add column if not exists is_state_committee   boolean default true;
+alter table public.board_committee_list add column if not exists is_country_committee boolean default false;
+
+-- NOTE: Create the storage bucket manually (cannot be done with the anon key):
+--   Supabase Dashboard → Storage → New bucket → Name: profile-pictures → Public bucket: ON
+--   Then add policies allowing INSERT/SELECT for the anon role (or disable RLS on the bucket).
+
+-- Circular FK: profiles.site_id → sites.id (added after sites table exists)
+do $$
+begin
+  if not exists (
+    select 1 from information_schema.table_constraints
+    where constraint_name = 'profiles_site_id_fkey'
+      and table_name = 'profiles'
+  ) then
+    alter table public.profiles
+      add constraint profiles_site_id_fkey
+      foreign key (site_id) references public.sites(id) on delete set null;
+  end if;
+end $$;
+
+-- ========================
+-- ACTIVITIES
+-- ========================
+create table if not exists public.activities (
+  id             uuid         default gen_random_uuid() primary key,
+  name           text         not null,
+  type           text         not null check (type in ('fee', 'data')),
+  site_id        uuid         references public.sites(id) on delete cascade,
+  target_amount  numeric(12,2),
+  due_date       date,
+  description    text,
+  assigned_users uuid[]       default '{}',
+  created_at     timestamptz  default now()
+);
+
+-- ========================
+-- FEE RECORDS
+-- ========================
+create table if not exists public.fee_records (
+  id            uuid          default gen_random_uuid() primary key,
+  activity_id   uuid          references public.activities(id) on delete cascade,
+  site_id       uuid          references public.sites(id) on delete cascade,
+  collected_by  uuid          references public.profiles(id) on delete set null,
+  payer_name    text          not null,
+  payer_phone   text,
+  amount        numeric(12,2) not null,
+  date          date          not null,
+  notes         text,
+  created_at    timestamptz   default now()
+);
+
+-- Audit records may contain multiple entries for one fee record (insert, update, approval).
+-- Keep the source fee id in `id`, but use a separate generated key for each audit entry.
+do $$
+begin
+  if to_regclass('public.au_fee_records') is not null then
+    alter table public.au_fee_records add column if not exists audit_id uuid default gen_random_uuid();
+    update public.au_fee_records set audit_id = gen_random_uuid() where audit_id is null;
+    alter table public.au_fee_records alter column audit_id set default gen_random_uuid();
+    alter table public.au_fee_records alter column audit_id set not null;
+    alter table public.au_fee_records drop constraint if exists au_fee_records_pkey;
+    alter table public.au_fee_records add constraint au_fee_records_pkey primary key (audit_id);
+  end if;
+end $$;
+
+-- ========================
+-- DATA RECORDS
+-- ========================
+create table if not exists public.data_records (
+  id            uuid         default gen_random_uuid() primary key,
+  activity_id   uuid         references public.activities(id) on delete cascade,
+  site_id       uuid         references public.sites(id) on delete cascade,
+  collected_by  uuid         references public.profiles(id) on delete set null,
+  person_name   text         not null,
+  address       text,
+  phone         text,
+  email         text,
+  date          date         not null,
+  notes         text,
+  created_at    timestamptz  default now()
+);
+
+-- Questionnaire answers may be stored without the legacy person fields.
+alter table public.data_records alter column person_name drop not null;
+alter table public.data_records add column if not exists qustion_id uuid;
+alter table public.data_records add column if not exists answer text;
+alter table public.data_records add column if not exists control_type text;
+alter table public.data_records add column if not exists member_id uuid;
+
+-- ========================
+-- DATA COLLECTION QUESTIONNAIRES
+-- One row defines one question for a data activity. The answer column stores
+-- the control type and selectable values as JSON.
+-- ========================
+create table if not exists public.data_forms (
+  id             uuid         not null default gen_random_uuid(),
+  event_id       uuid         not null references public.activities(id) on delete cascade,
+  questionnaire  varchar,
+  answer         text,
+  event_type_id  smallint,
+  notes          text,
+  constraint data_forms_pkey primary key (id, event_id)
+);
+alter table public.data_forms add column if not exists disp_order smallint;
+
+-- ========================
+-- ASSOCIATION EVENTS
+-- Run this before using Event Type 4 (Associations).
+-- ========================
+create table if not exists public.lookup_designation (
+  id          bigint generated by default as identity primary key,
+  designation text,
+  "order"     smallint
+);
+
+create table if not exists public.association_members (
+  id                    uuid        not null default gen_random_uuid(),
+  activity_id           uuid        not null references public.activities(id) on delete cascade,
+  created_at            timestamptz default now(),
+  association_member_id uuid        not null,
+  designation_id        bigint      references public.lookup_designation(id),
+  constraint association_members_pkey primary key (id, activity_id, association_member_id)
+);
+
+alter table public.lookup_designation disable row level security;
+alter table public.association_members disable row level security;
+
+-- ========================
+-- DISABLE RLS
+-- App handles all authorization logic.
+-- Enable & configure RLS policies before public internet deployment.
+-- ========================
+alter table public.profiles     disable row level security;
+alter table public.sites        disable row level security;
+alter table public.activities   disable row level security;
+alter table public.fee_records  disable row level security;
+alter table public.data_records disable row level security;
+
+-- ========================
+-- LOCATION LOOKUP TABLES
+-- Power the Country → State → District → City → Pin Code dropdowns in the Sites module.
+-- lookup_country / lookup_state / lookup_district already exist — created separately.
+-- ========================
+create table if not exists public.lookup_country (
+  country_id bigint generated by default as identity not null,
+  country    text,
+  "order"    smallint,
+  constraint lookup_country_pkey primary key (country_id)
+);
+
+create table if not exists public.lookup_state (
+  state_id   bigint generated by default as identity not null,
+  state      text,
+  country_id bigint references public.lookup_country(country_id),
+  "order"    smallint,
+  constraint lookup_state_pkey primary key (state_id)
+);
+
+create table if not exists public.lookup_district (
+  district_id bigint generated by default as identity not null,
+  district    text,
+  state_id    bigint references public.lookup_state(state_id),
+  "order"     smallint,
+  constraint lookup_district_pkey primary key (district_id)
+);
+
+create table if not exists public.lookup_city (
+  city_id     bigint generated by default as identity not null,
+  city        text,
+  district_id bigint references public.lookup_district(district_id),
+  "order"     smallint,
+  constraint lookup_city_pkey primary key (city_id)
+);
+
+create table if not exists public.lookup_pincode (
+  pincode_id  bigint generated by default as identity not null,
+  pincode     text,
+  city_id     bigint references public.lookup_city(city_id),
+  "order"     smallint,
+  constraint lookup_pincode_pkey primary key (pincode_id)
+);
+
+alter table public.lookup_country  disable row level security;
+alter table public.lookup_state    disable row level security;
+alter table public.lookup_district disable row level security;
+alter table public.lookup_city     disable row level security;
+alter table public.lookup_pincode  disable row level security;
+
+-- Done! Open the app — it will prompt you to create the Super Admin on first run.
